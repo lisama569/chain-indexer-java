@@ -22,6 +22,10 @@ public class IndexerMetrics {
     private final AtomicLong acceptedBlocks = new AtomicLong();
     private final AtomicLong acceptedTxs = new AtomicLong();
     private final AtomicLong reorgs = new AtomicLong();
+    /** 最近一次换链的回滚起点（共同祖先高度），-1 表示尚未发生或从创世重放。 */
+    private final AtomicLong lastReorgForkPoint = new AtomicLong(-1);
+    /** 最近一次换链重放的区块数。 */
+    private final AtomicLong lastReorgReplayedBlocks = new AtomicLong();
     private final AtomicLong queries = new AtomicLong();
     private final AtomicLong queryTotalNanos = new AtomicLong();
     private final AtomicLong queryMaxNanos = new AtomicLong();
@@ -41,8 +45,14 @@ public class IndexerMetrics {
         rejected.computeIfAbsent(reason, k -> new AtomicLong()).incrementAndGet();
     }
 
-    public void recordReorg() {
+    /**
+     * 记录一次换链（重组接管）：回滚到共同祖先 {@code forkPoint}，
+     * 并重放 {@code replayedBlocks} 个分叉区块。
+     */
+    public void recordReorg(long forkPoint, int replayedBlocks) {
         reorgs.incrementAndGet();
+        lastReorgForkPoint.set(forkPoint);
+        lastReorgReplayedBlocks.set(replayedBlocks);
     }
 
     public long startQuery() {
@@ -72,6 +82,8 @@ public class IndexerMetrics {
         m.put("acceptedTransactions", acceptedTxs.get());
         m.put("blocksPerSecond", String.format("%.3f", blocksPerSecond()));
         m.put("reorgs", reorgs.get());
+        m.put("lastReorgForkPoint", lastReorgForkPoint.get());
+        m.put("lastReorgReplayedBlocks", lastReorgReplayedBlocks.get());
         Map<String, Long> rej = new LinkedHashMap<>();
         rejected.forEach((k, v) -> rej.put(k, v.get()));
         m.put("rejectedByReason", rej);

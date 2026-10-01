@@ -11,6 +11,7 @@ import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
@@ -114,6 +115,21 @@ public class IndexerController {
     @GetMapping("/metrics")
     public Map<String, Object> metrics() {
         Map<String, Object> body = new LinkedHashMap<>(this.metrics.snapshot());
+        body.put("reorgMinLead", indexerService.reorgMinLead());
+        body.put("snapshot", snapshotInfo(snapshot()));
+        return body;
+    }
+
+    /**
+     * 运行时调整换链门槛（运维入口）。非法值回退安全默认并立即按新门槛
+     * 重判已收存的竞争链候选；若因此发生接管，响应中 tookOver=true。
+     */
+    @PostMapping("/config/reorg-min-lead")
+    public Map<String, Object> updateReorgMinLead(@RequestParam int value) {
+        boolean tookOver = indexerService.setReorgMinLead(value);
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("reorgMinLead", indexerService.reorgMinLead());
+        body.put("tookOver", tookOver);
         body.put("snapshot", snapshotInfo(snapshot()));
         return body;
     }

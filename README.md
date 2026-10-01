@@ -4,9 +4,11 @@
 
 - 按高度顺序摄入区块/交易，建立 **地址 → 交易**、**交易哈希 → 回执** 检索索引；
 - 重复区块、高度跳跃、父哈希不连续、同高度内容冲突均被**拒绝并返回可区分原因**，绝不静默覆盖；
-- 按最长链规则处理**链重组（reorg）**：回滚共同祖先并重放新链，重组期间/之后无旧链残留、无重复计数、无遗漏；短暂分叉抖动不会被误判为重组；
-- 摄入与查询并发下的**快照一致性**：每次查询明确对应某个确定高度与链标识，大范围扫描不阻塞摄入；
-- 摄入吞吐、拒绝分类计数、重组次数、查询延迟**可观测**。
+- **竞争链逐块到达自动接管**：分叉链从分叉点之后一块一块陆续投递时，每块都被收存为候选（不当脏数据丢弃、不丢候选信息），每次到达都会重判——一旦竞争链补齐且领先达到**换链门槛**，自动回滚到共同祖先并重放接管；追平或同高度碰撞只观察、不换链；
+- 按最长链规则处理**链重组（reorg）**：回滚共同祖先并重放新链，重组期间/之后无旧链残留、无重复计数、无遗漏；短暂分叉抖动不会被误判为重组；两条链反复互相超越时，任何时刻对外只暴露唯一一条规范链；
+- **可配置的换链门槛** `indexer.reorg-min-lead`：控制竞争链至少领先多少块才允许接管，默认 1（严格更长即接管），非法值给出明确提示并回退安全默认；
+- 摄入与查询并发下的**快照一致性**：每次查询明确对应某个确定高度与链标识，大范围扫描不阻塞摄入，连续换链过程中也读不到"重放了一半"的中间态；
+- 摄入吞吐、拒绝分类计数、重组次数（含最近一次回滚起点与重放块数）、查询延迟**可观测**。
 
 技术栈：Java 21+、Spring Boot 3.4（仅内存实现，无外部依赖）。
 
@@ -51,16 +53,16 @@
 2. 同哈希区块再次出现但**内容不一致** → `INVALID_BLOCK`（重放/碰撞保护）；
 3. 设当前规范链尖为 `tip`：
    - `height ≤ tip` 且哈希与规范块相同 → **`DUPLICATE_BLOCK`**：拒绝、不改变任何数据、交易不重复计数；
-   - `height ≤ tip` 且哈希不同 → **`HEIGHT_CONFLICT`**：同高度内容冲突（分叉抖动）。区块**收存**到 `ChainStore` 作为潜在分叉候选，但规范数据**绝不覆盖**；
-   - `height = tip+1` 且 `parentHash ≠ tipHash` → **`PARENT_HASH_MISMATCH`**：收存为分叉候选，拒绝延伸；
+   - `height ≤ tip` 且哈希不同 → **`HEIGHT_CONFLICT`**：同高度内容冲突（分叉抖动）。区块**收存**到 `ChainStore` 作为分叉候选，规范数据**绝不覆盖**，随后做接管判定（见 2.3）；
+   - `height = tip+1` 且 `parentHash ≠ tipHash` → **`PARENT_HASH_MISMATCH`**：收存为分叉候选（多为竞争链的延伸块），拒绝延伸，随后做接管判定；
    - `height = tip+1` 且父哈希连续（创世另判 `0x0`），且交易哈希未与既有交易冲突 → 接受并顺序延伸；
-   - `height > tip+1`：收存候选后，沿 `parentHash` 在区块池中回溯：
-     - 找不到挂在规范链上的共同祖先 → **`HEIGHT_GAP`**（缺中间块；待后续补齐后再次投递即可重组）；
-     - 能连通且候选链**严格更长**（候选高度 > tip）→ 触发重组。
+   - `height > tip+1`：收存候选后做接管判定；若无法沿 `parentHash` 回溯到规范链上的共同祖先 → **`HEIGHT_GAP`**（缺中间块；候选保留，后续每块到达都会自动重判）。
 
-> 说明：由于候选高度已大于 `tip+1`，凡能连通规范链的候选必然严格更长；
-> 等长/更短的抖动分叉在 `height ≤ tip` 路径已被归类为 `HEIGHT_CONFLICT`。
-> 因此“短暂的分叉抖动”永远不会产生 `reorg=true` 的结论。
+> **竞争链逐块到达**：一条从分叉点之后按高度逐块投递的竞争链，每一块的归属都是
+> 上面某条"收存候选"路径——候选信息不会丢，也不会被当成脏数据清掉。
+> 每次收存后都会立即在区块池中重判：是否存在已连通规范链、且链尖领先达到
+> 换链门槛的竞争链。满足则当场接管（`reorg=true`）；追平、同高度碰撞或领先不足
+> 时只继续观察，拒绝原因仍按该块与规范链的位置关系给出（可区分）。
 
 ### 2.2 拒绝原因对照（彼此可区分）
 
@@ -75,17 +77,40 @@
 `POST /api/blocks` 返回：`accepted, reorg, reason, detail, tipHeight, tipHash, chainId`，
 其中 `detail` 给出关键高度/哈希与判定依据。
 
-### 2.3 重组与回滚规则（最长链）
+### 2.3 重组与回滚规则（最长链 + 换链门槛）
 
-1. 在区块池 DFS 出候选块所有能落到规范链祖先的父路径，取链尖最高者；
-2. 找到**共同祖先**（分叉第一块的父，且该父在规范链上哈希一致）；
-3. **回滚**：从空索引开始，按规范链重放到共同祖先高度（等价于丢弃共同祖先之后的全部旧块索引）；
-4. **重放**：依次应用分叉块，重建区块/交易/回执/地址索引；
-5. 校验重放过程中交易哈希唯一性，任一冲突则整体拒绝（本次提交不改变状态）；
-6. 以**整体引用替换**发布新的不可变快照，返回 `reorg=true` 与 forkPoint/重放块数。
+1. 每次有候选块收存（或换链门槛被调整）时，在区块池中考察所有高度高于规范链尖的区块，
+   沿 `parentHash` 回溯，找出能落到规范链共同祖先（或创世）的**最长竞争链**
+   （等长/更短的分叉不参与判定，天然不可能满足门槛）；
+2. 若竞争链链尖高度 `≥ tip + reorgMinLead`（换链门槛，见 2.4）则触发接管，否则继续观察；
+3. 找到**共同祖先**（分叉第一块的父，且该父在规范链上哈希一致）；
+4. **回滚**：从空索引开始，按规范链重放到共同祖先高度（等价于丢弃共同祖先之后的全部旧块索引）；
+5. **重放**：依次应用分叉块，重建区块/交易/回执/地址索引；
+6. 校验重放过程中交易哈希唯一性，任一冲突则整体拒绝（本次提交不改变状态）；
+7. 以**整体引用替换**发布新的不可变快照，返回 `reorg=true`；
+   指标记录 `reorgs+1`、最近一次回滚起点 `lastReorgForkPoint` 与重放块数 `lastReorgReplayedBlocks`。
 
-一致性保证：重组后旧链分叉段的交易、回执、地址索引全部消失；共同祖先数据保留；
-新链交易全部入索引且不重复（测试 `ReorgTest.longerForkTriggersReorgWithRollbackAndReplay` 显式断言）。
+一致性保证：接管后旧链分叉段的交易、回执、地址索引全部消失；共同祖先数据保留；
+新链交易全部入索引且不重复。两条链反复互相超越时，被替换下去的链段仍留在区块池中，
+当它再次延伸并重新满足门槛时可再次接管——任何时刻快照里只有唯一一条规范链
+（`ReorgTest`、`FlipFlopConsistencyTest` 显式断言）。
+
+### 2.4 换链门槛 `indexer.reorg-min-lead`
+
+| 项 | 说明 |
+| --- | --- |
+| 含义 | 竞争链链尖至少要比当前规范链尖**高出多少块**，才允许回滚接管 |
+| 默认值 | `1`：竞争链只要**严格更长**（哪怕只多 1 块）即自动接管——这是默认验收口径 |
+| 配置方式 | `application.properties` 中 `indexer.reorg-min-lead=2`，或启动参数 `--indexer.reorg-min-lead=2` |
+| 运行时调整 | `POST /api/config/reorg-min-lead?value=2`；调整后**立即重判**已收存的候选：此前因门槛按住不发的竞争链若已满足条件，会当场接管（响应 `tookOver=true`） |
+| 非法值处理 | 非整数、空值、小于 1 的值都会打印**明确可读的 WARN 日志**并回退安全默认 `1`，不会悄悄用错误值继续跑，也不会让进程崩溃 |
+| 当前生效值 | `GET /api/metrics` 的 `reorgMinLead` 字段 |
+
+**与既有规则的兼容关系**：门槛最低为 1，即"至少严格更长才换链"是永远成立的底线——
+
+- **同高度抖动不换链**（`HEIGHT_CONFLICT`）：竞争链与规范链在同一高度碰撞时，领先为 0，任何合法门槛下都只收存观察；
+- **等长分叉不换链**：竞争链追平规范链尖时领先为 0，同样只观察；
+- 把门槛调高（如 2）后，领先 1 块的竞争链会被按住不发、继续盯着，等差距真的够了（或门槛调回）再切。
 
 ---
 
@@ -101,6 +126,9 @@
 - **摄入串行化**：并发下区块按到达顺序判定，不会出现交叉写入；
   `concurrentIngestAndQueryYieldsConsistentSnapshots` 在 400 块摄入 + 3 读者持续全量校验下，
   验证每个快照父子哈希相连、交易与回执成对、地址索引无重复计数。
+- **连续换链不脏读**：接管时的"回滚 + 重放"在写锁内先构建出完整新快照再一次性发布，
+  读者只会看到切换前或切换后的某个完整快照，永远读不到"重放了一半"的中间态；
+  `FlipFlopConsistencyTest` 在 6 轮互相超越期间用 3 个读者持续做独立重算校验。
 - 每个查询响应都带 `snapshot{version, tipHeight, tipHash, chainId}`，结论**可解释、可复现**。
 
 > 适用边界：内存实现，快照采用整表复制，面向演示与中小数据量；
@@ -114,9 +142,15 @@
 
 - `acceptedBlocks / acceptedTransactions / blocksPerSecond`：摄入吞吐；
 - `rejectedByReason`：按五种拒绝原因分类计数；
-- `reorgs`：重组次数；
+- `reorgs`：换链（重组接管）次数；
+- `lastReorgForkPoint`：最近一次换链的回滚起点（共同祖先高度，`-1` 表示尚未发生）；
+- `lastReorgReplayedBlocks`：最近一次换链重放的区块数；
+- `reorgMinLead`：当前生效的换链门槛（见 2.4）；
 - `queries / queryAvgNanos / queryMaxNanos`：查询量与延迟；
 - `snapshot`：当前链尖高度/哈希/链标识。
+
+`POST /api/config/reorg-min-lead?value=N`：运行时调整换链门槛，
+返回生效值与 `tookOver`（本次调整是否直接触发了接管）。
 
 日志在每次摄入时打印**输入摘要**（高度、哈希、父哈希、chainId、交易哈希列表）与
 **判定依据**（accepted/reason/reorg/关键高度哈希）；重组打印 `REORG committed` 行。
@@ -135,9 +169,17 @@ mvn test
 | --- | --- |
 | `NormalIngestTest` | 创世与顺序摄入、地址与回执索引、交易不重复计数、重复提交 `DUPLICATE_BLOCK` |
 | `RejectionReasonTest` | `HEIGHT_GAP`、`PARENT_HASH_MISMATCH`、`HEIGHT_CONFLICT`、各类 `INVALID_BLOCK`，断言既有数据不被覆盖 |
-| `ReorgTest` | 分叉抖动不重组；跳跃投递先 `HEIGHT_GAP`、补齐后严格更长触发重组；回滚/重放后无旧链残留/重复/遗漏；等长分叉不重组 |
+| `ReorgTest` | 分叉抖动不重组；跳跃投递先 `HEIGHT_GAP`、逐块补齐后严格更长当场接管；回滚/重放后无旧链残留/重复/遗漏；等长分叉不重组 |
+| `CompetingChainTakeoverTest` | 竞争链逐块到达：未反超只观察不丢候选、严格更长自动接管；门槛调高后领先不足按住不发、差距达标再切；门槛调低立即重判并接管；非法门槛回退安全默认 |
+| `FlipFlopConsistencyTest` | 两链 6 轮反复互相超越：每轮后索引与"按规范链重算"精确一致（无混链/残留/悬空引用）；连续切换中并发查询读不到中间态 |
 | `ConcurrencySnapshotTest` | 400 块并发摄入下每个快照内部自洽；大范围慢查询不阻塞摄入 |
-| `WebApiTest` | HTTP 端到端：摄入/拒绝原因/快照上下文/地址索引/metrics |
+| `WebApiTest` | HTTP 端到端：摄入/拒绝原因/快照上下文/地址索引/metrics；换链门槛与换链统计的对外暴露、非法调整回退默认 |
+
+只跑新场景：
+
+```bash
+mvn test -Dtest=CompetingChainTakeoverTest,FlipFlopConsistencyTest
+```
 
 测试日志（surefire 输出）逐条打印“输入摘要 + 判定依据”，失败原因可区分。
 
@@ -163,13 +205,25 @@ curl -s localhost:8080/api/receipts/t0
 curl -s localhost:8080/api/metrics
 ```
 
+换链门槛（含义见 2.4）：
+
+```bash
+# 查看当前生效门槛与换链统计
+curl -s localhost:8080/api/metrics | grep -E 'reorgMinLead|reorgs|lastReorg'
+# 调高门槛为 2（非法值如 0 会回退默认 1 并打印 WARN）
+curl -s -XPOST 'localhost:8080/api/config/reorg-min-lead?value=2'
+# 以门槛 2 直接启动
+mvn spring-boot:run -Dspring-boot.run.arguments="--indexer.reorg-min-lead=2"
+```
+
 ### 5.4 代码地图
 
 ```
 domain/        Block / Transaction / Receipt
 ingest/        RejectReason / IngestResult（判定结论，可解释）
 storage/       ChainStore（只追加区块池，含分叉）
-indexer/       IndexerService（校验/拒绝/重组/快照发布）、ChainSnapshot（不可变快照）
+indexer/       IndexerService（校验/拒绝/接管判定/重组/快照发布）、ChainSnapshot（不可变快照）
+config/        IndexerProperties（换链门槛配置：解析、校验、非法值回退默认）
 metrics/       IndexerMetrics
 web/           IndexerController（REST）
 support/       DemoData        demo/   DemoRunner

@@ -92,4 +92,27 @@ class WebApiTest {
                 .andExpect(jsonPath("$.queries").exists())
                 .andExpect(jsonPath("$.snapshot.tipHeight").value(1));
     }
+
+    @Test
+    void reorgThresholdConfigAndSwitchMetricsAreExposed() throws Exception {
+        // 默认门槛与换链统计可从指标接口读取
+        mvc.perform(get("/api/metrics"))
+                .andExpect(jsonPath("$.reorgMinLead").value(1))
+                .andExpect(jsonPath("$.reorgs").exists())
+                .andExpect(jsonPath("$.lastReorgForkPoint").exists())
+                .andExpect(jsonPath("$.lastReorgReplayedBlocks").exists());
+
+        // 运维调高门槛：生效并回显
+        mvc.perform(post("/api/config/reorg-min-lead").param("value", "2"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.reorgMinLead").value(2))
+                .andExpect(jsonPath("$.tookOver").value(false));
+        mvc.perform(get("/api/metrics"))
+                .andExpect(jsonPath("$.reorgMinLead").value(2));
+
+        // 非法值（<1）：回退安全默认 1，而不是沿用错误值
+        mvc.perform(post("/api/config/reorg-min-lead").param("value", "0"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.reorgMinLead").value(1));
+    }
 }

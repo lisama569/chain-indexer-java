@@ -88,7 +88,9 @@ class ReorgTest {
         assertEquals(RejectReason.HEIGHT_GAP, gap.reason());
         assertEquals(3, svc.currentSnapshot().tipHeight());
 
-        // 补齐分叉区块（升序），最后一块到达时应触发重组
+        // 补齐分叉区块（升序）：h=2,3 同高度冲突收存为候选；
+        // h=4 到达时，分叉链在区块池中已能连通到链尖 h=5（此前跳跃投递时已收存），
+        // 且严格更长（默认门槛：领先 1 块即可），当场自动接管并一路重放到 h=5
         IngestResult last = null;
         for (int i = 0; i < fork.size() - 1; i++) {
             log.info("[case] 补分叉块: {}", fork.get(i).summary());
@@ -96,14 +98,19 @@ class ReorgTest {
             log.info("[case] 判定依据: accepted={} reason={} reorg={}",
                     last.accepted(), last.reason(), last.reorg());
         }
-        // 再次投递链尖，此刻分叉完整且严格更长
-        log.info("[case] 分叉补齐后重投链尖: {}", tipFirst.summary());
-        last = svc.ingest(tipFirst);
-        log.info("[case] 判定依据: accepted={} reorg={} detail={} tip={}/{}",
-                last.accepted(), last.reorg(), last.detail(), last.tipHeight(), last.tipHash());
-
         assertTrue(last.accepted());
-        assertTrue(last.reorg(), "严格更长分叉必须触发重组");
+        assertTrue(last.reorg(), "分叉补齐且严格更长时必须当场接管");
+        assertEquals(5, last.tipHeight(), "链尖 h=5 已在区块池中，接管时一并重放到位");
+        assertEquals(ChainGenerator.forkHash("chain-B", 5), last.tipHash());
+
+        // 再次投递链尖：已在规范链上，幂等拒绝、数据不变
+        log.info("[case] 接管后重投链尖: {}", tipFirst.summary());
+        last = svc.ingest(tipFirst);
+        log.info("[case] 判定依据: accepted={} reason={} detail={} tip={}/{}",
+                last.accepted(), last.reason(), last.detail(), last.tipHeight(), last.tipHash());
+
+        assertFalse(last.accepted());
+        assertEquals(RejectReason.DUPLICATE_BLOCK, last.reason());
         assertEquals(5, last.tipHeight());
         assertEquals(ChainGenerator.forkHash("chain-B", 5), last.tipHash());
         assertEquals("chain-B", last.chainId());

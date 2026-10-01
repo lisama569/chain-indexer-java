@@ -68,6 +68,26 @@ public class ChainStore {
     }
 
     /**
+     * 所有高度严格大于 {@code height} 的已见区块（含分叉候选）。
+     * 用于在逐块到达的竞争链场景中寻找"可能已领先规范链"的候选链尖。
+     */
+    public List<Block> findAllAbove(long height) {
+        List<Block> out = new ArrayList<>();
+        hashesByHeight.forEach((h, hashes) -> {
+            if (h <= height) {
+                return;
+            }
+            for (String hash : hashes) {
+                Block b = byHash.get(hash);
+                if (b != null) {
+                    out.add(b);
+                }
+            }
+        });
+        return out;
+    }
+
+    /**
      * 从给定链尖沿 parentHash 回溯，返回从创世到该链尖的有序区块列表。
      * 遇到未知父哈希即终止（用于重组时重建一条完整链）。
      */

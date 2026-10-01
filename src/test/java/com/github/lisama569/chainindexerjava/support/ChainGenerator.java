@@ -53,4 +53,22 @@ public class ChainGenerator {
     public List<Block> genesisChain(String chainId, int n) {
         return chain(chainId, 0, n, GENESIS_PARENT);
     }
+
+    /**
+     * 生成一条分叉链：从 forkPoint+1 开始逐块延伸 count 块，
+     * 第一块的父哈希为 startParentHash，区块哈希使用分叉变体（h'）。
+     * 交易哈希为 chainId-tx{高度}，地址固定 addrB -> addrC。
+     */
+    public List<Block> forkChain(String chainId, int forkPoint, int count, String startParentHash) {
+        List<Block> blocks = new ArrayList<>();
+        String parent = startParentHash;
+        for (int i = 1; i <= count; i++) {
+            long h = forkPoint + i;
+            String hash = forkHash(chainId, h);
+            blocks.add(block(h, hash, parent, chainId,
+                    List.of(tx("%s-tx%d".formatted(chainId, h), "addrB", "addrC", 200 + h))));
+            parent = hash;
+        }
+        return blocks;
+    }
 }
