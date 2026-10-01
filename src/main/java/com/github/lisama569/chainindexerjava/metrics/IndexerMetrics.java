@@ -22,6 +22,11 @@ public class IndexerMetrics {
     private final AtomicLong acceptedBlocks = new AtomicLong();
     private final AtomicLong acceptedTxs = new AtomicLong();
     private final AtomicLong reorgs = new AtomicLong();
+    /** 最近一次换链（接管）信息：-1/空表示尚未发生过。 */
+    private volatile long lastReorgForkPoint = -1L;
+    private volatile long lastReorgReplayedBlocks = 0L;
+    private volatile String lastReorgTipHash = null;
+    private volatile String lastReorgChainId = null;
     private final AtomicLong queries = new AtomicLong();
     private final AtomicLong queryTotalNanos = new AtomicLong();
     private final AtomicLong queryMaxNanos = new AtomicLong();
@@ -43,6 +48,18 @@ public class IndexerMetrics {
 
     public void recordReorg() {
         reorgs.incrementAndGet();
+    }
+
+    /**
+     * 记录一次换链接管：回滚起始高度（共同祖先）、重放块数、新链尖哈希与链标识。
+     * 供对外接口直接暴露"切换过几次、最近一次从哪回滚、重放了多少块"。
+     */
+    public void recordReorg(long forkPoint, long replayedBlocks, String newTipHash, String newChainId) {
+        reorgs.incrementAndGet();
+        this.lastReorgForkPoint = forkPoint;
+        this.lastReorgReplayedBlocks = replayedBlocks;
+        this.lastReorgTipHash = newTipHash;
+        this.lastReorgChainId = newChainId;
     }
 
     public long startQuery() {
@@ -72,6 +89,10 @@ public class IndexerMetrics {
         m.put("acceptedTransactions", acceptedTxs.get());
         m.put("blocksPerSecond", String.format("%.3f", blocksPerSecond()));
         m.put("reorgs", reorgs.get());
+        m.put("lastReorgForkPoint", lastReorgForkPoint);
+        m.put("lastReorgReplayedBlocks", lastReorgReplayedBlocks);
+        m.put("lastReorgTipHash", lastReorgTipHash == null ? "" : lastReorgTipHash);
+        m.put("lastReorgChainId", lastReorgChainId == null ? "" : lastReorgChainId);
         Map<String, Long> rej = new LinkedHashMap<>();
         rejected.forEach((k, v) -> rej.put(k, v.get()));
         m.put("rejectedByReason", rej);

@@ -1,5 +1,6 @@
 package com.github.lisama569.chainindexerjava.indexer;
 
+import com.github.lisama569.chainindexerjava.config.IndexerProperties;
 import com.github.lisama569.chainindexerjava.domain.Block;
 import com.github.lisama569.chainindexerjava.domain.Receipt;
 import com.github.lisama569.chainindexerjava.domain.Transaction;
@@ -9,6 +10,7 @@ import com.github.lisama569.chainindexerjava.metrics.IndexerMetrics;
 import com.github.lisama569.chainindexerjava.storage.ChainStore;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
@@ -38,14 +40,22 @@ public class IndexerService {
 
     private final ChainStore store;
     private final IndexerMetrics metrics;
+    private final IndexerProperties properties;
     private final ReentrantLock ingestLock = new ReentrantLock();
 
     /** 当前已发布快照，volatile 引用整体替换保证读者可见性。 */
     private volatile ChainSnapshot current;
 
+    /** 便捷构造：默认换链门槛（严格更长即接管），供测试与本地装配使用。 */
     public IndexerService(ChainStore store, IndexerMetrics metrics) {
+        this(store, metrics, new IndexerProperties(IndexerProperties.DEFAULT_REORG_MIN_LEAD));
+    }
+
+    @Autowired
+    public IndexerService(ChainStore store, IndexerMetrics metrics, IndexerProperties properties) {
         this.store = store;
         this.metrics = metrics;
+        this.properties = properties;
         this.current = emptySnapshot();
     }
 
@@ -56,6 +66,37 @@ public class IndexerService {
 
     public ChainSnapshot currentSnapshot() {
         return current;
+    }
+
+    /** 当前生效的换链门槛（竞争链须领先规范链的块数）。 */
+    public long reorgMinLead() {
+        return properties.reorgMinLead();
+    }
+
+    /** 运行期调整换链门槛；非法值退回安全默认，返回生效值。 */
+    public long setReorgMinLead(long value) {
+        return properties.setReorgMinLead(value);
+    }
+
+    /**
+     * 当前观察到的竞争链（分叉）列表：区块池中不是规范链尖的所有链尖。
+     * 逐块到达、暂未超过规范链的竞争链在这里持续可见，不会被当作脏数据丢弃。
+     */
+    public List<ForkStatus> observedForks() {
+        ChainSnapshot snap = current;
+        long minLead = properties.reorgMinLead();
+        List<ForkStatus> out = new ArrayList<>();
+        for (Block tip : store.tips()) {
+            if (Objects.equals(tip.hash(), snap.tipHash())) {
+                continue; // 规范链尖本身不是分叉
+            }
+            boolean connected = findLongestConnectingFork(tip, snap) != null;
+            long lead = tip.height() - snap.tipHeight();
+            out.add(new ForkStatus(tip.hash(), tip.height(), tip.chainId(),
+                    connected, lead, connected && lead >= minLead));
+        }
+        out.sort((a, b) -> Long.compare(b.tipHeight(), a.tipHeight()));
+        return List.copyOf(out);
     }
 
     // ------------------------------------------------------------------
@@ -100,8 +141,13 @@ public class IndexerService {
                         block);
             }
             // 高度已被规范链占用但内容不同：同高度冲突 / 分叉抖动。
-            // 存入 ChainStore 作为潜在分叉候选，但绝不覆盖规范链数据。
+            // 存入 ChainStore 作为潜在分叉候选，但绝不覆盖规范链数据；
+            // 收存后统一评估：若竞争链已补齐且领先达到门槛，立即接管。
             store.put(block);
+            IngestResult takeover = tryTakeover(snap, block);
+            if (takeover != null) {
+                return takeover;
+            }
             return reject(RejectReason.HEIGHT_CONFLICT,
                     ("高度 %d 已存在规范区块 hash=%s，收到不同 hash=%s（分叉抖动，"
                             + "按最长链规则暂不覆盖；已收存为分叉候选）")
@@ -111,8 +157,13 @@ public class IndexerService {
 
         if (h == snap.tipHeight() + 1) {
             if (!Objects.equals(block.parentHash(), snap.tipHash())) {
-                // 父哈希不连续：可能是分叉链尖，收存候选但拒绝延伸
+                // 父哈希不连续：可能是分叉链尖，收存候选；
+                // 若该候选让竞争链接通且领先达到门槛（默认严格更长），立即接管。
                 store.put(block);
+                IngestResult takeover = tryTakeover(snap, block);
+                if (takeover != null) {
+                    return takeover;
+                }
                 return reject(RejectReason.PARENT_HASH_MISMATCH,
                         "高度 %d 的父哈希 %s 与规范链尖 %s 不连续（已收存为分叉候选）"
                                 .formatted(h, block.parentHash(), snap.tipHash()),
@@ -135,35 +186,75 @@ public class IndexerService {
 
         // h > tip+1：可能是跳跃输入，也可能带来一条更长分叉
         store.put(block);
-        List<Block> fork = findLongestConnectingFork(block, snap);
-        if (fork == null || fork.isEmpty()) {
-            return reject(RejectReason.HEIGHT_GAP,
-                    ("高度 %d 跳跃（当前链尖 %d），且无法沿父哈希回溯到规范链上的共同祖先，"
-                            + "缺少中间区块（已收存，待补齐）")
-                            .formatted(h, snap.tipHeight()),
+        List<Block> fork = bestConnectingFork(snap);
+        if (fork != null) {
+            long lead = fork.get(fork.size() - 1).height() - snap.tipHeight();
+            long minLead = properties.reorgMinLead();
+            if (lead >= minLead) {
+                return doReorg(fork, snap, block);
+            }
+            // 已连通但领先不足门槛：按住不发，继续观察（候选全部保留）
+            return reject(RejectReason.FORK_NOT_AHEAD,
+                    ("竞争链已连通规范链（分叉尖高度 %d），但仅领先 %d 块，"
+                            + "未达到换链门槛 %d，继续观察暂不换链（候选已收存）")
+                            .formatted(fork.get(fork.size() - 1).height(), lead, minLead),
                     block);
         }
+        return reject(RejectReason.HEIGHT_GAP,
+                ("高度 %d 跳跃（当前链尖 %d），且无法沿父哈希回溯到规范链上的共同祖先，"
+                        + "缺少中间区块（已收存，待补齐）")
+                        .formatted(h, snap.tipHeight()),
+                block);
+    }
 
-        Block forkTip = fork.get(fork.size() - 1);
-        // 能回溯连接到规范链的候选块高度一定 > tip，故此处分叉必然严格更长；
-        // 等长/更短的抖动分叉在此前 h<=tip 路径已被归类为 HEIGHT_CONFLICT。
+    /**
+     * 换链评估：找出区块池中"挂在当前规范链上"的最长竞争分叉，
+     * 其链尖领先规范链尖达到换链门槛时执行接管；否则返回 null（继续观察）。
+     * 竞争链逐块/乱序到达时，每收存一个候选都会触发本评估，
+     * 因此分叉一旦补齐并真正超过当前链即自动接管，候选信息不会丢失。
+     */
+    private IngestResult tryTakeover(ChainSnapshot snap, Block trigger) {
+        List<Block> fork = bestConnectingFork(snap);
+        if (fork == null) {
+            return null;
+        }
+        long lead = fork.get(fork.size() - 1).height() - snap.tipHeight();
+        if (lead < properties.reorgMinLead()) {
+            return null;
+        }
+        return doReorg(fork, snap, trigger);
+    }
 
-        // 严格更长：回滚到共同祖先，重放分叉区块重建索引
+    /** 扫描区块池中所有高于链尖的候选块，返回能连通规范链的最长分叉（无则 null）。 */
+    private List<Block> bestConnectingFork(ChainSnapshot snap) {
+        List<Block> best = null;
+        for (Block candidate : store.blocksAbove(snap.tipHeight())) {
+            List<Block> f = findLongestConnectingFork(candidate, snap);
+            if (f != null && !f.isEmpty()
+                    && (best == null
+                            || f.get(f.size() - 1).height() > best.get(best.size() - 1).height())) {
+                best = f;
+            }
+        }
+        return best;
+    }
+
+    /** 执行接管：回滚到共同祖先、重放分叉区块、整体发布新快照。 */
+    private IngestResult doReorg(List<Block> fork, ChainSnapshot snap, Block trigger) {
         Block anchor = GENESIS_PARENT.equals(fork.get(0).parentHash())
                 ? null
                 : store.findByHash(fork.get(0).parentHash()).orElse(null);
         long forkPoint = anchor == null ? -1L : anchor.height();
-        ChainSnapshot base = rebuildUpTo(forkPoint);
-        ChainSnapshot rebuilt = base;
+        ChainSnapshot rebuilt = rebuildUpTo(forkPoint);
         for (Block b : fork) {
             String clash = findTxClash(b, rebuilt);
             if (clash != null) {
-                return reject(RejectReason.INVALID_BLOCK, clash, block);
+                return reject(RejectReason.INVALID_BLOCK, clash, trigger);
             }
             rebuilt = applyBlock(rebuilt, b);
         }
         publish(rebuilt);
-        metrics.recordReorg();
+        metrics.recordReorg(forkPoint, fork.size(), rebuilt.tipHash(), rebuilt.chainId());
         for (Block b : fork) {
             metrics.recordAccepted(b.transactions().size());
         }
@@ -172,7 +263,7 @@ public class IndexerService {
         return IngestResult.reorged(
                 ("检测到更长分叉：回滚至共同祖先高度 %d，重放 %d 个区块，新链尖 %s")
                         .formatted(forkPoint, fork.size(), rebuilt.tipHash()),
-                rebuilt.tipHeight(), rebuilt.tipHash(), forkTip.chainId());
+                rebuilt.tipHeight(), rebuilt.tipHash(), rebuilt.chainId());
     }
 
     /**

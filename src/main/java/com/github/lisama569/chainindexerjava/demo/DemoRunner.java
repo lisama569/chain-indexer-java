@@ -66,6 +66,8 @@ public class DemoRunner implements ApplicationRunner {
                 snap.version(), snap.tipHeight(), snap.tipHash(), snap.chainId(),
                 snap.blocks().size(), snap.txByHash().size());
         log.info("addrB 相关交易: {}", snap.transactionsOf("addrB"));
+        log.info("换链门槛 reorgMinLead={} | 观察中的竞争链: {}",
+                indexer.reorgMinLead(), indexer.observedForks());
         log.info(metrics.report());
         log.info("==================== 本地链索引演示结束 ====================");
     }

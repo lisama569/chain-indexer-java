@@ -53,9 +53,10 @@ public class DemoData {
     }
 
     /**
-     * chain-B 从共同祖先 A#h1 分叉：
-     * h=2,3 与规范同高度（HEIGHT_CONFLICT 抖动），h=4 父哈希不连续（PARENT_HASH_MISMATCH），
-     * h=5 高于 tip+1，沿父哈希回溯到共同祖先且严格更长，触发重组。
+     * chain-B 从共同祖先 A#h1 分叉，逐块到达：
+     * h=2,3 与规范同高度（HEIGHT_CONFLICT 抖动，收存观察），
+     * h=4 到达时分叉接通且严格更长（默认门槛 1），当次提交即触发接管，
+     * h=5 在新规范链上顺序延伸。
      */
     public List<Block> forkBlocks() {
         List<Block> fork = new ArrayList<>();

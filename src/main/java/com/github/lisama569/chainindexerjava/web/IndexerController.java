@@ -4,6 +4,7 @@ import com.github.lisama569.chainindexerjava.domain.Block;
 import com.github.lisama569.chainindexerjava.domain.Receipt;
 import com.github.lisama569.chainindexerjava.domain.Transaction;
 import com.github.lisama569.chainindexerjava.indexer.ChainSnapshot;
+import com.github.lisama569.chainindexerjava.indexer.ForkStatus;
 import com.github.lisama569.chainindexerjava.indexer.IndexerService;
 import com.github.lisama569.chainindexerjava.ingest.IngestResult;
 import com.github.lisama569.chainindexerjava.metrics.IndexerMetrics;
@@ -12,6 +13,7 @@ import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.util.LinkedHashMap;
@@ -59,7 +61,9 @@ public class IndexerController {
         long t = metrics.startQuery();
         try {
             ChainSnapshot snap = snapshot();
-            return withSnapshot(Map.of("block", snap.blockAt(height).orElse(null)));
+            Map<String, Object> data = new LinkedHashMap<>();
+            data.put("block", snap.blockAt(height).orElse(null));
+            return withSnapshot(data);
         } finally {
             metrics.endQuery(t);
         }
@@ -70,7 +74,9 @@ public class IndexerController {
         long t = metrics.startQuery();
         try {
             ChainSnapshot snap = snapshot();
-            return withSnapshot(Map.of("transaction", snap.transaction(txHash).orElse(null)));
+            Map<String, Object> data = new LinkedHashMap<>();
+            data.put("transaction", snap.transaction(txHash).orElse(null));
+            return withSnapshot(data);
         } finally {
             metrics.endQuery(t);
         }
@@ -116,6 +122,49 @@ public class IndexerController {
         Map<String, Object> body = new LinkedHashMap<>(this.metrics.snapshot());
         body.put("snapshot", snapshotInfo(snapshot()));
         return body;
+    }
+
+    /** 正在观察的竞争链（分叉）列表与当前换链门槛。 */
+    @GetMapping("/forks")
+    public Map<String, Object> forks() {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("reorgMinLead", indexerService.reorgMinLead());
+        body.put("forks", indexerService.observedForks().stream().map(this::forkInfo).toList());
+        body.put("snapshot", snapshotInfo(snapshot()));
+        return body;
+    }
+
+    /** 当前换链门槛配置。 */
+    @GetMapping("/config")
+    public Map<String, Object> config() {
+        return Map.of("reorgMinLead", indexerService.reorgMinLead());
+    }
+
+    /**
+     * 运行期调整换链门槛。非法值（<1）不生效：返回可读提示与退回后的安全生效值。
+     */
+    @PostMapping("/config/reorg-min-lead")
+    public Map<String, Object> setReorgMinLead(@RequestParam long value) {
+        long effective = indexerService.setReorgMinLead(value);
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("requested", value);
+        body.put("reorgMinLead", effective);
+        if (effective != value) {
+            body.put("warning",
+                    "换链门槛 %d 非法（必须 >= 1），已退回安全默认 %d".formatted(value, effective));
+        }
+        return body;
+    }
+
+    private Map<String, Object> forkInfo(ForkStatus f) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("tipHash", f.tipHash());
+        m.put("tipHeight", f.tipHeight());
+        m.put("chainId", f.chainId());
+        m.put("connectedToCanonical", f.connectedToCanonical());
+        m.put("leadHeight", f.leadHeight());
+        m.put("takeoverReady", f.takeoverReady());
+        return m;
     }
 
     private ChainSnapshot snapshot() {

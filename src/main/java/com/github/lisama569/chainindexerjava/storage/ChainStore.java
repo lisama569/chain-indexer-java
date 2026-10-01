@@ -67,6 +67,43 @@ public class ChainStore {
         return findAllByHeight(height).stream().findFirst();
     }
 
+    /** 所有高度严格大于给定值的已见区块（含分叉候选），供换链评估扫描。 */
+    public List<Block> blocksAbove(long height) {
+        List<Block> out = new ArrayList<>();
+        hashesByHeight.forEach((h, hashes) -> {
+            if (h > height) {
+                for (String hash : hashes) {
+                    Block b = byHash.get(hash);
+                    if (b != null) {
+                        out.add(b);
+                    }
+                }
+            }
+        });
+        return out;
+    }
+
+    /**
+     * 当前区块池中的"链尖"集合：没有任何其他已见区块以其为父的区块。
+     * 用于对外暴露"正在观察的竞争链"状态。
+     */
+    public List<Block> tips() {
+        Set<String> referencedAsParent = new HashSet<>();
+        for (Block b : byHash.values()) {
+            String p = b.parentHash();
+            if (p != null && !p.isBlank()) {
+                referencedAsParent.add(p);
+            }
+        }
+        List<Block> out = new ArrayList<>();
+        for (Block b : byHash.values()) {
+            if (!referencedAsParent.contains(b.hash())) {
+                out.add(b);
+            }
+        }
+        return out;
+    }
+
     /**
      * 从给定链尖沿 parentHash 回溯，返回从创世到该链尖的有序区块列表。
      * 遇到未知父哈希即终止（用于重组时重建一条完整链）。

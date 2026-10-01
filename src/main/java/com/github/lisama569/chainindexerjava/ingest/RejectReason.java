@@ -12,6 +12,8 @@ public enum RejectReason {
     PARENT_HASH_MISMATCH,
     /** 同一高度已存在不同内容（分叉抖动 / 高度冲突），不静默覆盖 */
     HEIGHT_CONFLICT,
+    /** 竞争链已连通规范链但领先不足换链门槛，继续观察、暂不换链 */
+    FORK_NOT_AHEAD,
     /** 区块自身数据不合法（空哈希、交易重复等） */
     INVALID_BLOCK
 }
