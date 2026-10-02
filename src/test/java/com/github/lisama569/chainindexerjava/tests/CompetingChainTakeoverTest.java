@@ -147,7 +147,7 @@ class CompetingChainTakeoverTest {
         assertEquals(0L, metrics.snapshot().get("reorgs"));
 
         // 门槛调回 1：立即重判，此前按住的分叉当场接管
-        boolean tookOver = svc.setReorgMinLead(1);
+        boolean tookOver = svc.setReorgMinLead(1).tookOver();
         log.info("[case] 门槛 2->1 后 tookOver={} tip={}/{}",
                 tookOver, svc.currentSnapshot().tipHeight(), svc.currentSnapshot().tipHash());
         assertTrue(tookOver, "门槛调低后已满足条件的候选必须立即接管");

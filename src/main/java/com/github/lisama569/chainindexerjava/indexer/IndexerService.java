@@ -89,10 +89,15 @@ public class IndexerService {
      * 运行时调整换链门槛（非法值打印可读 WARN 并回退安全默认）。
      * 调整后立即对已收存的竞争链候选重判：若此前因门槛按住不发的分叉
      * 现已满足条件，则当场接管。
+     * <p>
+     * 返回的 {@link ThresholdUpdateResult#tookOver()} 如实反映本次调整
+     * 是否真的完成了一次换链接管：若接管中途失败（如重放时交易哈希冲突），
+     * 索引数据保持完全不变，tookOver=false 且 detail 给出可读原因，
+     * 绝不报告一个假的成功。
      *
-     * @return 本次调整是否直接触发了一次换链接管
+     * @return 生效值、是否真实接管、可读说明
      */
-    public boolean setReorgMinLead(int newMinLead) {
+    public ThresholdUpdateResult setReorgMinLead(int newMinLead) {
         ingestLock.lock();
         try {
             int sanitized = IndexerProperties.sanitizeMinLead(newMinLead, log);
@@ -101,12 +106,33 @@ public class IndexerService {
             log.info("换链门槛更新: {} -> {}（请求值 {}）", old, sanitized, newMinLead);
             ChainSnapshot snap = current;
             List<Block> fork = findBestFork(snap);
-            if (fork != null
-                    && fork.get(fork.size() - 1).height() >= snap.tipHeight() + sanitized) {
-                takeover(fork, null);
-                return true;
+            if (fork == null) {
+                return new ThresholdUpdateResult(sanitized, false,
+                        ("门槛 %d -> %d 已生效；区块池中没有已连通规范链的竞争链候选，"
+                                + "无需接管，索引数据未变").formatted(old, sanitized));
             }
-            return false;
+            long forkTip = fork.get(fork.size() - 1).height();
+            long need = snap.tipHeight() + sanitized;
+            if (forkTip < need) {
+                return new ThresholdUpdateResult(sanitized, false,
+                        ("门槛 %d -> %d 已生效；竞争链候选链尖 h=%d 未达到接管条件 "
+                                + "h>=%d，继续观察，索引数据未变")
+                                .formatted(old, sanitized, forkTip, need));
+            }
+            ChainSnapshot before = current;
+            IngestResult r = takeover(fork, null);
+            if (!r.reorg()) {
+                // 接管未真正完成（如重放时交易哈希冲突被整体拒绝）：
+                // 状态必须保持完全不变，反馈如实说明
+                boolean unchanged = current == before;
+                log.warn("门槛调整后接管未完成: {}（快照未变={}）", r.detail(), unchanged);
+                return new ThresholdUpdateResult(sanitized, false,
+                        ("门槛 %d -> %d 已生效，但本次接管未完成，索引数据保持不变；原因：%s")
+                                .formatted(old, sanitized, r.detail()));
+            }
+            return new ThresholdUpdateResult(sanitized, true,
+                    ("门槛 %d -> %d 已生效，并触发换链接管：%s")
+                            .formatted(old, sanitized, r.detail()));
         } finally {
             ingestLock.unlock();
         }
