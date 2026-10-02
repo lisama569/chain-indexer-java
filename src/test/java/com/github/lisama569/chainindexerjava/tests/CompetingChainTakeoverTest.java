@@ -5,6 +5,7 @@ import com.github.lisama569.chainindexerjava.indexer.ChainSnapshot;
 import com.github.lisama569.chainindexerjava.indexer.IndexerService;
 import com.github.lisama569.chainindexerjava.ingest.IngestResult;
 import com.github.lisama569.chainindexerjava.ingest.RejectReason;
+import com.github.lisama569.chainindexerjava.ingest.ThresholdUpdateResult;
 import com.github.lisama569.chainindexerjava.metrics.IndexerMetrics;
 import com.github.lisama569.chainindexerjava.storage.ChainStore;
 import com.github.lisama569.chainindexerjava.support.ChainGenerator;
@@ -147,11 +148,13 @@ class CompetingChainTakeoverTest {
         assertEquals(0L, metrics.snapshot().get("reorgs"));
 
         // 门槛调回 1：立即重判，此前按住的分叉当场接管
-        boolean tookOver = svc.setReorgMinLead(1);
-        log.info("[case] 门槛 2->1 后 tookOver={} tip={}/{}",
-                tookOver, svc.currentSnapshot().tipHeight(), svc.currentSnapshot().tipHash());
-        assertTrue(tookOver, "门槛调低后已满足条件的候选必须立即接管");
-        assertEquals(1, svc.reorgMinLead());
+        ThresholdUpdateResult update = svc.setReorgMinLead(1);
+        log.info("[case] 门槛 2->1 后 tookOver={} detail={} tip={}/{}",
+                update.tookOver(), update.detail(),
+                svc.currentSnapshot().tipHeight(), svc.currentSnapshot().tipHash());
+        assertTrue(update.tookOver(), "门槛调低后已满足条件的候选必须立即接管");
+        assertEquals(1, update.requestedValue());
+        assertEquals(1, update.effectiveValue());
         ChainSnapshot snap = svc.currentSnapshot();
         assertEquals(4, snap.tipHeight());
         assertEquals(ChainGenerator.forkHash("chain-B", 4), snap.tipHash());
@@ -184,7 +187,9 @@ class CompetingChainTakeoverTest {
         // 运行时调整非法值：同样回退默认而不是沿用错误值
         IndexerService svc = new IndexerService(new ChainStore(), new IndexerMetrics(), 3);
         assertEquals(3, svc.reorgMinLead());
-        svc.setReorgMinLead(0);
-        assertEquals(1, svc.reorgMinLead(), "运行时非法调整必须回退安全默认 1");
+        ThresholdUpdateResult invalid = svc.setReorgMinLead(0);
+        assertEquals(0, invalid.requestedValue());
+        assertEquals(1, invalid.effectiveValue(), "运行时非法调整必须回退安全默认 1");
+        assertFalse(invalid.tookOver());
     }
 }

@@ -172,14 +172,18 @@ class FlipFlopConsistencyTest {
         AtomicInteger failures = new AtomicInteger();
         AtomicReference<String> firstError = new AtomicReference<>();
 
-        // 读者线程：切换全程不断抓取快照做独立重算校验
+        // 读者线程：切换全程不断抓取快照做独立重算校验，并按"查询语义"核验
+        // 每次结论（命中/可判定空）都与同一快照的 tipHeight/chainId 自洽
         List<Thread> readers = new ArrayList<>();
         for (int i = 0; i < 3; i++) {
+            final int readerIdx = i;
             Thread t = new Thread(() -> {
                 try {
                     start.await();
                     while (!stop.get()) {
-                        assertFullyConsistent(svc.currentSnapshot());
+                        ChainSnapshot snap = svc.currentSnapshot();
+                        assertFullyConsistent(snap);
+                        assertQuerySemanticsOnSnapshot(snap, readerIdx);
                     }
                 } catch (AssertionError e) {
                     failures.incrementAndGet();
@@ -222,7 +226,46 @@ class FlipFlopConsistencyTest {
         assertEquals(10, fin.tipHeight());
         assertEquals("chain-A", fin.chainId());
         assertFullyConsistent(fin);
+        // 查询语义收尾：被替换段的交易在最终规范链上必须可判定为"不存在"，
+        // 且这一空结论与同一快照上下文对应
+        assertQuerySemanticsOnSnapshot(fin, -1);
         log.info("[case] 6 轮互相超越完成，并发查询无不一致；最终 tip={}/{} chainId={}",
                 fin.tipHeight(), fin.tipHash(), fin.chainId());
+    }
+
+    /**
+     * 以"对外查询"的视角核验快照上的命中/空结果：
+     * 0..tip 高度必命中且属于快照 chainId；tip+1 与负高度可判定为空；
+     * 已知被替换链段的交易可判定为空（仅在它们确实不属于当前快照时）；
+     * 命中交易与回执成对存在，且都在链尖高度范围内。
+     */
+    private void assertQuerySemanticsOnSnapshot(ChainSnapshot snap, int readerIdx) {
+        long tip = snap.tipHeight();
+        for (long h = 0; h <= tip; h++) {
+            Block b = snap.blockAt(h).orElse(null);
+            assertNotNull(b,
+                    "高度 %d 应命中区块（tip=%d, chain=%s）".formatted(h, tip, snap.chainId()));
+            // 命中区块内的每笔交易都可查到，高度一致，且回执成对存在
+            for (Transaction tx : b.transactions()) {
+                Transaction got = snap.transaction(tx.txHash()).orElse(null);
+                assertNotNull(got, "命中区块内交易 " + tx.txHash() + " 必须可查到");
+                assertEquals(h, got.blockHeight());
+                assertTrue(snap.receipt(tx.txHash()).isPresent(),
+                        "命中交易必须有成对回执");
+            }
+        }
+        // 超出链尖：空结果（不抛错、不命中）
+        assertTrue(snap.blockAt(tip + 1).isEmpty(), "超出链尖的高度必须可判定为空");
+        // 被换链替换的链段交易：在当前规范链上可判定为空；回执同样为空
+        for (String replaced : List.of("chain-B-tx8", "chain-B-tx9")) {
+            if (snap.transaction(replaced).isEmpty()) {
+                assertTrue(snap.receipt(replaced).isEmpty(),
+                        "已替换交易的回执不得残留: " + replaced);
+            }
+        }
+        if (readerIdx == 0 && tip == 10) {
+            log.info("[case] 查询语义校验(读者0,终态) tip={} chainId={} 被替换交易可判定为空",
+                    tip, snap.chainId());
+        }
     }
 }

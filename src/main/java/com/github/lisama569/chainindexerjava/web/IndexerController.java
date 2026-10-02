@@ -6,6 +6,7 @@ import com.github.lisama569.chainindexerjava.domain.Transaction;
 import com.github.lisama569.chainindexerjava.indexer.ChainSnapshot;
 import com.github.lisama569.chainindexerjava.indexer.IndexerService;
 import com.github.lisama569.chainindexerjava.ingest.IngestResult;
+import com.github.lisama569.chainindexerjava.ingest.ThresholdUpdateResult;
 import com.github.lisama569.chainindexerjava.metrics.IndexerMetrics;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -60,7 +61,18 @@ public class IndexerController {
         long t = metrics.startQuery();
         try {
             ChainSnapshot snap = snapshot();
-            return withSnapshot(Map.of("block", snap.blockAt(height).orElse(null)));
+            Map<String, Object> data = new LinkedHashMap<>();
+            data.put("height", height);
+            Block block = snap.blockAt(height).orElse(null);
+            data.put("found", block != null);
+            data.put("block", block);
+            if (block == null) {
+                data.put("message", ("高度 %d 在当前规范链上没有区块（快照链尖 h=%d, chainId=%s）："
+                        + "可能尚未摄入到该高度，或该高度已超出当前链尖；"
+                        + "该结论对应下面 snapshot 标识的确定快照").formatted(
+                        height, snap.tipHeight(), snap.chainId()));
+            }
+            return withSnapshot(data);
         } finally {
             metrics.endQuery(t);
         }
@@ -71,7 +83,15 @@ public class IndexerController {
         long t = metrics.startQuery();
         try {
             ChainSnapshot snap = snapshot();
-            return withSnapshot(Map.of("transaction", snap.transaction(txHash).orElse(null)));
+            Map<String, Object> data = new LinkedHashMap<>();
+            data.put("txHash", txHash);
+            Transaction tx = snap.transaction(txHash).orElse(null);
+            data.put("found", tx != null);
+            data.put("transaction", tx);
+            if (tx == null) {
+                data.put("message", missingTxMessage(txHash, snap));
+            }
+            return withSnapshot(data);
         } finally {
             metrics.endQuery(t);
         }
@@ -83,10 +103,14 @@ public class IndexerController {
         try {
             ChainSnapshot snap = snapshot();
             Map<String, Object> data = new LinkedHashMap<>();
+            data.put("txHash", txHash);
             Receipt receipt = snap.receipt(txHash).orElse(null);
+            data.put("found", receipt != null);
             data.put("receipt", receipt);
             if (receipt != null) {
                 data.put("transaction", snap.transaction(txHash).orElse(null));
+            } else {
+                data.put("message", missingTxMessage(txHash, snap));
             }
             return withSnapshot(data);
         } finally {
@@ -103,13 +127,28 @@ public class IndexerController {
             List<Transaction> txs = hashes.stream()
                     .map(h -> snap.transaction(h).orElse(null))
                     .toList();
-            return withSnapshot(Map.of(
-                    "address", address,
-                    "count", hashes.size(),
-                    "transactions", txs));
+            Map<String, Object> data = new LinkedHashMap<>();
+            data.put("address", address);
+            data.put("found", !hashes.isEmpty());
+            data.put("count", hashes.size());
+            data.put("transactions", txs);
+            if (hashes.isEmpty()) {
+                data.put("message", ("地址 %s 在当前规范链上没有相关交易（快照链尖 h=%d, chainId=%s）："
+                        + "可能从未出现，或其交易所在区块已在换链中被替换").formatted(
+                        address, snap.tipHeight(), snap.chainId()));
+            }
+            return withSnapshot(data);
         } finally {
             metrics.endQuery(t);
         }
+    }
+
+    /** 交易/回执缺失时统一的可读说明（含快照链尖与链标识）。 */
+    private String missingTxMessage(String txHash, ChainSnapshot snap) {
+        return ("交易 %s 在当前规范链上不存在（快照链尖 h=%d, chainId=%s）："
+                + "可能从未摄入该交易，或其所在区块已在换链重组中被替换、"
+                + "不再属于规范链；该结论对应下面 snapshot 标识的确定快照")
+                .formatted(txHash, snap.tipHeight(), snap.chainId());
     }
 
     @GetMapping("/metrics")
@@ -126,10 +165,12 @@ public class IndexerController {
      */
     @PostMapping("/config/reorg-min-lead")
     public Map<String, Object> updateReorgMinLead(@RequestParam int value) {
-        boolean tookOver = indexerService.setReorgMinLead(value);
+        ThresholdUpdateResult r = indexerService.setReorgMinLead(value);
         Map<String, Object> body = new LinkedHashMap<>();
-        body.put("reorgMinLead", indexerService.reorgMinLead());
-        body.put("tookOver", tookOver);
+        body.put("requestedValue", r.requestedValue());
+        body.put("reorgMinLead", r.effectiveValue());
+        body.put("tookOver", r.tookOver());
+        body.put("detail", r.detail());
         body.put("snapshot", snapshotInfo(snapshot()));
         return body;
     }

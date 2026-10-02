@@ -8,6 +8,7 @@
 - 按最长链规则处理**链重组（reorg）**：回滚共同祖先并重放新链，重组期间/之后无旧链残留、无重复计数、无遗漏；短暂分叉抖动不会被误判为重组；两条链反复互相超越时，任何时刻对外只暴露唯一一条规范链；
 - **可配置的换链门槛** `indexer.reorg-min-lead`：控制竞争链至少领先多少块才允许接管，默认 1（严格更长即接管），非法值给出明确提示并回退安全默认；
 - 摄入与查询并发下的**快照一致性**：每次查询明确对应某个确定高度与链标识，大范围扫描不阻塞摄入，连续换链过程中也读不到"重放了一半"的中间态；
+- **数据缺失可判定**：高度没有区块、交易不存在或已被换链替换时，查询返回 HTTP 200 + `found=false` + 可读说明 + 快照上下文，与回执/地址查询的空结果表现一致，调用方无需靠异常分支判断；
 - 摄入吞吐、拒绝分类计数、重组次数（含最近一次回滚起点与重放块数）、查询延迟**可观测**。
 
 技术栈：Java 21+、Spring Boot 3.4（仅内存实现，无外部依赖）。
@@ -36,7 +37,7 @@
    - `txHashesByAddr: address -> List<txHash>`：地址相关交易，按高度、区块内序号有序，列表去重；
    - 快照头 `version, tipHeight, tipHash, chainId` 明确标识“这份索引对应哪条链的哪个高度”。
 
-**检索能力**
+**检索能力**（数据缺失时一律返回 **HTTP 200 + 可判定空结果**，不会抛服务端错误，见 2.5）
 
 - 交易哈希 → 交易：`GET /api/transactions/{txHash}`
 - 交易哈希 → 回执：`GET /api/receipts/{txHash}`
@@ -112,6 +113,61 @@
 - **等长分叉不换链**：竞争链追平规范链尖时领先为 0，同样只观察；
 - 把门槛调高（如 2）后，领先 1 块的竞争链会被按住不发、继续盯着，等差距真的够了（或门槛调回）再切。
 
+**调整结果反馈（如实反映是否真的换链）**：`POST /api/config/reorg-min-lead?value=N` 返回
+
+```json
+{
+  "requestedValue": 1,
+  "reorgMinLead": 1,
+  "tookOver": false,
+  "detail": "门槛已更新为 1（请求值 1）；存在领先达到 1 块的竞争链，但接管未能完成——重放校验被拒：交易哈希 dup 已存在于高度 0，拒绝重复索引（block=B#h1p）；本次未发生换链，索引数据保持完全不变",
+  "snapshot": {"version": 3, "tipHeight": 2, "tipHash": "A#h2", "chainId": "chain-A"}
+}
+```
+
+| 字段 | 含义 |
+| --- | --- |
+| `requestedValue` | 调用方请求的门槛值（非法时与实际生效值不同） |
+| `reorgMinLead` | 实际生效门槛（非法输入回退安全默认 1） |
+| `tookOver` | **本次调整是否真的完成了换链**。只有竞争链重放成功、新快照整体发布后才为 `true`；达标候选若在重放时被拒（如交易哈希冲突），接管不会发生，此处必须为 `false` |
+| `detail` | 可读结论：已接管 / 无达标候选 / 达标但接管未完成及原因 |
+| `snapshot` | 调整（及可能的接管）完成后索引对应的确定高度与链标识；`tookOver=false` 时它与调整前完全一致 |
+
+接管重放属于"全有或全无"：任何一块分叉区块校验失败（如交易哈希与共同祖先段重复），
+都不会发布半成品快照——索引数据保持**完全不变**（快照版本、链尖、交易/回执/地址索引、
+`reorgs` 指标都不动），绝不会出现"报告已换链但查询和指标什么都没变"的假成功。
+摄入路径（竞争链在某块到达时首次达到门槛）同样适用：重放失败时该块返回
+`accepted=false, reorg=false, reason=INVALID_BLOCK`，而不是谎报 `reorg=true`。
+
+### 2.5 数据缺失时的查询返回语义
+
+区块/交易/回执/地址四类查询，在"查不到"时统一返回 **HTTP 200**（不再抛服务端错误），
+响应体用 `found` 明确可判定、附可读 `message`，并照常带这次结论对应的
+`snapshot{version, tipHeight, tipHash, chainId}`——即"在哪个高度、哪条链的索引上判定为空"。
+
+| 查询 | 空结果场景 | 响应 |
+| --- | --- | --- |
+| `GET /api/blocks/{height}` | 高度尚未摄入到 / 已超出当前链尖 | `found=false`、`block=null`、`height` 回显、`message` + `snapshot` |
+| `GET /api/transactions/{txHash}` | 交易从未出现，或所在区块已在换链中被替换、不再属于规范链 | `found=false`、`transaction=null`、`txHash` 回显、`message` + `snapshot` |
+| `GET /api/receipts/{txHash}` | 同上（回执与交易成对出现、成对消失） | `found=false`、`receipt=null`、`message` + `snapshot` |
+| `GET /api/addresses/{address}/transactions` | 地址从未出现，或其交易所在链段已被替换 | `found=false`、`count=0`、`transactions=[]`、`message` + `snapshot` |
+
+示例（链尖 h=2、chain-B；查一个已被换链替换掉的旧链交易）：
+
+```json
+{
+  "txHash": "atx1",
+  "found": false,
+  "transaction": null,
+  "message": "交易 atx1 在当前规范链上不存在（快照链尖 h=2, chainId=chain-B）：可能从未摄入该交易，或其所在区块已在换链重组中被替换、不再属于规范链；该结论对应下面 snapshot 标识的确定快照",
+  "snapshot": {"version": 3, "tipHeight": 2, "tipHash": "B#h2p", "chainId": "chain-B"}
+}
+```
+
+> 说明：本服务只保留"规范链索引 + 区块池（含分叉候选）"。被替换链段的区块仍在区块池中，
+> 但它们的交易/回执不进入规范链快照，因此对上述查询一律表现为可判定为空，
+> 且空结论与命中结论一样绑定同一个确定快照。
+
 ---
 
 ## 3. 并发一致性语义
@@ -150,7 +206,8 @@
 - `snapshot`：当前链尖高度/哈希/链标识。
 
 `POST /api/config/reorg-min-lead?value=N`：运行时调整换链门槛，
-返回生效值与 `tookOver`（本次调整是否直接触发了接管）。
+返回 `requestedValue / reorgMinLead（生效值）/ tookOver（本次是否真的接管）/ detail（可读结论）/ snapshot`。
+`tookOver` 与索引、指标的实际变化严格一致；接管重放失败时为 `false` 且数据完全不变（见 2.4）。
 
 日志在每次摄入时打印**输入摘要**（高度、哈希、父哈希、chainId、交易哈希列表）与
 **判定依据**（accepted/reason/reorg/关键高度哈希）；重组打印 `REORG committed` 行。
@@ -171,17 +228,22 @@ mvn test
 | `RejectionReasonTest` | `HEIGHT_GAP`、`PARENT_HASH_MISMATCH`、`HEIGHT_CONFLICT`、各类 `INVALID_BLOCK`，断言既有数据不被覆盖 |
 | `ReorgTest` | 分叉抖动不重组；跳跃投递先 `HEIGHT_GAP`、逐块补齐后严格更长当场接管；回滚/重放后无旧链残留/重复/遗漏；等长分叉不重组 |
 | `CompetingChainTakeoverTest` | 竞争链逐块到达：未反超只观察不丢候选、严格更长自动接管；门槛调高后领先不足按住不发、差距达标再切；门槛调低立即重判并接管；非法门槛回退安全默认 |
-| `FlipFlopConsistencyTest` | 两链 6 轮反复互相超越：每轮后索引与"按规范链重算"精确一致（无混链/残留/悬空引用）；连续切换中并发查询读不到中间态 |
+| `FlipFlopConsistencyTest` | 两链 6 轮反复互相超越：每轮后索引与"按规范链重算"精确一致（无混链/残留/悬空引用）；连续切换中 3 个并发读者做结构重算 + 查询语义（命中/可判定空、交易与回执成对）双重校验，读不到中间态 |
 | `ConcurrencySnapshotTest` | 400 块并发摄入下每个快照内部自洽；大范围慢查询不阻塞摄入 |
-| `WebApiTest` | HTTP 端到端：摄入/拒绝原因/快照上下文/地址索引/metrics；换链门槛与换链统计的对外暴露、非法调整回退默认 |
+| `MissingDataQueryTest` | **HTTP**：空索引/未到高度/超链尖查区块返回 200+`found=false`；从未出现与已被换链替换的交易、回执返回可判定空；无交易地址 `found=false,count=0`；所有空结果带可读 `message` 与快照上下文 |
+| `ThresholdFeedbackTest` | 门槛调整反馈如实：达标候选重放冲突时 `tookOver=false` 且索引/`reorgs` 完全不变、detail 可读；正常调低门槛成功接管为 `true`；无候选/非法值为 `false`；摄入路径重放失败也不谎报 `reorg` |
+| `WebApiTest` | HTTP 端到端：摄入/拒绝原因/快照上下文/地址索引/metrics；换链门槛与换链统计的对外暴露、非法调整回退默认；重放失败时门槛接口如实返回 `tookOver=false` 且链尖不变 |
 
-只跑新场景：
+只跑数据缺失与门槛反馈场景：
 
 ```bash
-mvn test -Dtest=CompetingChainTakeoverTest,FlipFlopConsistencyTest
+mvn test -Dtest=MissingDataQueryTest,ThresholdFeedbackTest
 ```
 
-测试日志（surefire 输出）逐条打印“输入摘要 + 判定依据”，失败原因可区分。
+测试日志（surefire 输出）逐条打印"输入摘要 + 判定依据"，新用例还会以
+`[业务:缺失区块查询]`、`[业务:被替换交易查询]`、`[业务:门槛反馈]` 等前缀
+打印每类场景的请求/结论（HTTP 状态、found、tookOver、detail、快照上下文），
+便于从日志直接看出覆盖了哪些业务与各类结果，失败原因可区分。
 
 ### 5.2 启动内置演示
 
@@ -195,6 +257,8 @@ mvn spring-boot:run -Dspring-boot.run.arguments="--demo"
 
 ### 5.3 手工 HTTP 验证
 
+以下命令假设服务运行在 `localhost:8080`（换端口：`--server.port=18080`）。
+
 ```bash
 curl -s -XPOST localhost:8080/api/blocks -H 'Content-Type: application/json' -d '{
   "height":0,"hash":"A#h0","parentHash":"0x0","chainId":"chain-A",
@@ -205,7 +269,65 @@ curl -s localhost:8080/api/receipts/t0
 curl -s localhost:8080/api/metrics
 ```
 
-换链门槛（含义见 2.4）：
+数据缺失场景（修复前均为 500，修复后为 200 + 可判定空结果 + 快照上下文）：
+
+```bash
+# 1) 高度尚未摄入/超出链尖 -> found=false，并带快照链尖与 chainId
+curl -s localhost:8080/api/blocks/9
+# 2) 从未出现的交易 / 回执
+curl -s localhost:8080/api/transactions/ghost
+curl -s localhost:8080/api/receipts/ghost
+# 3) 无相关交易的地址
+curl -s localhost:8080/api/addresses/nobody/transactions
+```
+
+换链后查询被替换掉的交易（返回空而不是报错，且 snapshot 指向新链）：
+
+```bash
+# 继续吃一块 chain-A，再从 h=1 投一条更长的 chain-B（默认门槛 1 当场接管）
+curl -s -XPOST localhost:8080/api/blocks -H 'Content-Type: application/json' -d '{
+  "height":1,"hash":"A#h1","parentHash":"A#h0","chainId":"chain-A",
+  "transactions":[{"txHash":"a1","from":"alice","to":"carol","value":20,"blockHeight":1}]}'
+curl -s -XPOST localhost:8080/api/blocks -H 'Content-Type: application/json' -d '{
+  "height":1,"hash":"B#h1p","parentHash":"A#h0","chainId":"chain-B",
+  "transactions":[{"txHash":"b1","from":"dave","to":"bob","value":20,"blockHeight":1}]}'
+curl -s -XPOST localhost:8080/api/blocks -H 'Content-Type: application/json' -d '{
+  "height":2,"hash":"B#h2p","parentHash":"B#h1p","chainId":"chain-B",
+  "transactions":[{"txHash":"b2","from":"dave","to":"carol","value":20,"blockHeight":2}]}'
+curl -s localhost:8080/api/transactions/a1      # found=false, snapshot.chainId=chain-B
+```
+
+门槛反馈如实性（重放冲突导致接管没做成，`tookOver` 必须是 `false` 且数据不变）：
+
+```bash
+# 新起一个干净实例后执行
+curl -s -XPOST 'localhost:8080/api/config/reorg-min-lead?value=3'
+# chain-A h=0..2（h0 交易哈希为 dup）
+curl -s -XPOST localhost:8080/api/blocks -H 'Content-Type: application/json' -d '{
+  "height":0,"hash":"A#h0","parentHash":"0x0","chainId":"chain-A",
+  "transactions":[{"txHash":"dup","from":"alice","to":"bob","value":10,"blockHeight":0}]}'
+curl -s -XPOST localhost:8080/api/blocks -H 'Content-Type: application/json' -d '{
+  "height":1,"hash":"A#h1","parentHash":"A#h0","chainId":"chain-A",
+  "transactions":[{"txHash":"a1","from":"alice","to":"bob","value":10,"blockHeight":1}]}'
+curl -s -XPOST localhost:8080/api/blocks -H 'Content-Type: application/json' -d '{
+  "height":2,"hash":"A#h2","parentHash":"A#h1","chainId":"chain-A",
+  "transactions":[{"txHash":"a2","from":"alice","to":"bob","value":10,"blockHeight":2}]}'
+# chain-B h=1 复用共同祖先交易 dup（重放必然冲突），门槛 3 下先被按住
+curl -s -XPOST localhost:8080/api/blocks -H 'Content-Type: application/json' -d '{
+  "height":1,"hash":"B#h1p","parentHash":"A#h0","chainId":"chain-B",
+  "transactions":[{"txHash":"dup","from":"alice","to":"bob","value":10,"blockHeight":1}]}'
+curl -s -XPOST localhost:8080/api/blocks -H 'Content-Type: application/json' -d '{
+  "height":2,"hash":"B#h2p","parentHash":"B#h1p","chainId":"chain-B",
+  "transactions":[{"txHash":"b2","from":"alice","to":"bob","value":10,"blockHeight":2}]}'
+curl -s -XPOST localhost:8080/api/blocks -H 'Content-Type: application/json' -d '{
+  "height":3,"hash":"B#h3p","parentHash":"B#h2p","chainId":"chain-B",
+  "transactions":[{"txHash":"b3","from":"alice","to":"bob","value":10,"blockHeight":3}]}'
+# 调低门槛：tookOver=false，detail 说明重放被拒；链尖仍是 chain-A h2，reorgs=0
+curl -s -XPOST 'localhost:8080/api/config/reorg-min-lead?value=1'
+curl -s localhost:8080/api/metrics | grep -o '"reorgs":[0-9]*'
+```
+
+换链门槛的正常调整（含义见 2.4）：
 
 ```bash
 # 查看当前生效门槛与换链统计
@@ -220,7 +342,7 @@ mvn spring-boot:run -Dspring-boot.run.arguments="--indexer.reorg-min-lead=2"
 
 ```
 domain/        Block / Transaction / Receipt
-ingest/        RejectReason / IngestResult（判定结论，可解释）
+ingest/        RejectReason / IngestResult（摄入判定结论，可解释）/ ThresholdUpdateResult（门槛调整结论，tookOver 如实）
 storage/       ChainStore（只追加区块池，含分叉）
 indexer/       IndexerService（校验/拒绝/接管判定/重组/快照发布）、ChainSnapshot（不可变快照）
 config/        IndexerProperties（换链门槛配置：解析、校验、非法值回退默认）

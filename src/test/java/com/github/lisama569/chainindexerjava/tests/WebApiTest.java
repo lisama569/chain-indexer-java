@@ -6,6 +6,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.http.MediaType;
+import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.web.servlet.MockMvc;
 
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
@@ -18,6 +19,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
  */
 @SpringBootTest
 @AutoConfigureMockMvc
+@DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_EACH_TEST_METHOD)
 class WebApiTest {
 
     @Autowired
@@ -91,6 +93,67 @@ class WebApiTest {
                 .andExpect(jsonPath("$.rejectedByReason.HEIGHT_GAP").value(1))
                 .andExpect(jsonPath("$.queries").exists())
                 .andExpect(jsonPath("$.snapshot.tipHeight").value(1));
+    }
+
+    @Test
+    void thresholdTakeoverFeedbackMatchesRealityWhenReplayFails() throws Exception {
+        // 高门槛按住竞争链；该竞争链与共同祖先有重复交易，调低门槛时接管必然失败
+        mvc.perform(post("/api/config/reorg-min-lead").param("value", "3"))
+                .andExpect(jsonPath("$.tookOver").value(false));
+
+        mvc.perform(post("/api/blocks").contentType(MediaType.APPLICATION_JSON).content("""
+                {"height":0,"hash":"W#h0","parentHash":"0x0","chainId":"chain-W",
+                 "transactions":[{"txHash":"wdup","from":"alice","to":"bob","value":10,"blockHeight":0}]}
+                """)).andExpect(jsonPath("$.accepted").value(true));
+        mvc.perform(post("/api/blocks").contentType(MediaType.APPLICATION_JSON).content("""
+                {"height":1,"hash":"W#h1","parentHash":"W#h0","chainId":"chain-W",
+                 "transactions":[{"txHash":"w1","from":"alice","to":"bob","value":10,"blockHeight":1}]}
+                """)).andExpect(jsonPath("$.accepted").value(true));
+        mvc.perform(post("/api/blocks").contentType(MediaType.APPLICATION_JSON).content("""
+                {"height":2,"hash":"W#h2","parentHash":"W#h1","chainId":"chain-W",
+                 "transactions":[{"txHash":"w2","from":"alice","to":"bob","value":10,"blockHeight":2}]}
+                """)).andExpect(jsonPath("$.accepted").value(true));
+
+        // 竞争链 X h=1..3：X1 复用共同祖先交易 wdup；门槛 3 下按住
+        for (String json : new String[]{
+                """
+                {"height":1,"hash":"X#h1p","parentHash":"W#h0","chainId":"chain-X",
+                 "transactions":[{"txHash":"wdup","from":"alice","to":"bob","value":10,"blockHeight":1}]}
+                """,
+                """
+                {"height":2,"hash":"X#h2p","parentHash":"X#h1p","chainId":"chain-X",
+                 "transactions":[{"txHash":"x2","from":"alice","to":"bob","value":10,"blockHeight":2}]}
+                """,
+                """
+                {"height":3,"hash":"X#h3p","parentHash":"X#h2p","chainId":"chain-X",
+                 "transactions":[{"txHash":"x3","from":"alice","to":"bob","value":10,"blockHeight":3}]}
+                """
+        }) {
+            mvc.perform(post("/api/blocks").contentType(MediaType.APPLICATION_JSON).content(json))
+                    .andExpect(jsonPath("$.reorg").value(false));
+        }
+
+        // 调低门槛：接管重放冲突，反馈必须如实为 tookOver=false
+        mvc.perform(post("/api/config/reorg-min-lead").param("value", "1"))
+                .andDo(r -> org.slf4j.LoggerFactory.getLogger(WebApiTest.class).info(
+                        "[业务:门槛反馈HTTP] 重放失败 -> {}", r.getResponse().getContentAsString()))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.requestedValue").value(1))
+                .andExpect(jsonPath("$.reorgMinLead").value(1))
+                .andExpect(jsonPath("$.tookOver").value(false))
+                .andExpect(jsonPath("$.detail").value(
+                        org.hamcrest.Matchers.containsString("未能完成")))
+                .andExpect(jsonPath("$.snapshot.chainId").value("chain-W"))
+                .andExpect(jsonPath("$.snapshot.tipHash").value("W#h2"));
+
+        // 索引保持不变：链尖仍是 chain-W，竞争链数据未入索引
+        mvc.perform(get("/api/chain/head"))
+                .andExpect(jsonPath("$.head.chainId").value("chain-W"))
+                .andExpect(jsonPath("$.head.tipHeight").value(2));
+        mvc.perform(get("/api/transactions/x2"))
+                .andExpect(jsonPath("$.found").value(false));
+        mvc.perform(get("/api/metrics"))
+                .andExpect(jsonPath("$.reorgs").value(0));
     }
 
     @Test

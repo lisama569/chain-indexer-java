@@ -6,6 +6,7 @@ import com.github.lisama569.chainindexerjava.domain.Receipt;
 import com.github.lisama569.chainindexerjava.domain.Transaction;
 import com.github.lisama569.chainindexerjava.ingest.IngestResult;
 import com.github.lisama569.chainindexerjava.ingest.RejectReason;
+import com.github.lisama569.chainindexerjava.ingest.ThresholdUpdateResult;
 import com.github.lisama569.chainindexerjava.metrics.IndexerMetrics;
 import com.github.lisama569.chainindexerjava.storage.ChainStore;
 import org.slf4j.Logger;
@@ -89,10 +90,12 @@ public class IndexerService {
      * 运行时调整换链门槛（非法值打印可读 WARN 并回退安全默认）。
      * 调整后立即对已收存的竞争链候选重判：若此前因门槛按住不发的分叉
      * 现已满足条件，则当场接管。
-     *
-     * @return 本次调整是否直接触发了一次换链接管
+     * <p>
+     * 返回结果如实反映本次调整：只有接管真正完成（新快照已发布）
+     * {@code tookOver} 才为 true；若达标候选在重放时被拒绝而接管未完成，
+     * {@code tookOver=false}，索引数据保持完全不变，{@code detail} 说明原因。
      */
-    public boolean setReorgMinLead(int newMinLead) {
+    public ThresholdUpdateResult setReorgMinLead(int newMinLead) {
         ingestLock.lock();
         try {
             int sanitized = IndexerProperties.sanitizeMinLead(newMinLead, log);
@@ -100,13 +103,35 @@ public class IndexerService {
             this.reorgMinLead = sanitized;
             log.info("换链门槛更新: {} -> {}（请求值 {}）", old, sanitized, newMinLead);
             ChainSnapshot snap = current;
-            List<Block> fork = findBestFork(snap);
-            if (fork != null
-                    && fork.get(fork.size() - 1).height() >= snap.tipHeight() + sanitized) {
-                takeover(fork, null);
-                return true;
+            List<List<Block>> eligible = eligibleForks(snap, sanitized);
+            String firstClash = null;
+            for (List<Block> fork : eligible) {
+                TakeoverAttempt attempt = attemptTakeover(fork);
+                if (attempt.succeeded()) {
+                    ChainSnapshot after = attempt.snapshot();
+                    String detail = ("门槛调整 %d -> %d 后立即重判，竞争链满足条件并已成功接管；%s")
+                            .formatted(old, sanitized, attempt.detail());
+                    return new ThresholdUpdateResult(newMinLead, sanitized, true, detail,
+                            after.tipHeight(), after.tipHash(), after.chainId());
+                }
+                log.warn("门槛调整后候选链重放被拒，接管未发生（索引不变）: {}", attempt.detail());
+                if (firstClash == null) {
+                    firstClash = attempt.detail();
+                }
             }
-            return false;
+            if (!eligible.isEmpty()) {
+                // 有达到门槛的候选，但重放均被拒绝：绝不能谎报成功，索引保持完全不变
+                String detail = ("门槛已更新为 %d（请求值 %d）；存在领先达到 %d 块的竞争链，"
+                        + "但接管未能完成——重放校验被拒：%s；本次未发生换链，索引数据保持完全不变")
+                        .formatted(sanitized, newMinLead, sanitized, firstClash);
+                return new ThresholdUpdateResult(newMinLead, sanitized, false, detail,
+                        snap.tipHeight(), snap.tipHash(), snap.chainId());
+            }
+            String detail = ("门槛已更新为 %d（请求值 %d）；当前没有连通规范链且领先达到 %d 块的"
+                    + "竞争链，本次未发生换链，索引数据不变")
+                    .formatted(sanitized, newMinLead, sanitized);
+            return new ThresholdUpdateResult(newMinLead, sanitized, false, detail,
+                    snap.tipHeight(), snap.tipHash(), snap.chainId());
         } finally {
             ingestLock.unlock();
         }
@@ -199,31 +224,68 @@ public class IndexerService {
      * 候选已收存后的统一接管判定：若当前存在连通规范链且领先达到换链门槛的
      * 竞争链，则回滚接管并返回 reorg 结果；否则保持观察，按该区块与规范链的
      * 位置关系返回可区分的拒绝原因（候选信息保留，绝不丢弃）。
+     * <p>
+     * 若存在达到门槛的候选，但全部在重放校验中被拒绝（如交易哈希冲突），
+     * 则按 {@code INVALID_BLOCK} 拒绝本次输入，索引完全不变。
      */
     private IngestResult observeOrTakeover(Block trigger, RejectReason pendingReason,
                                            String pendingDetail) {
         ChainSnapshot snap = current;
-        List<Block> fork = findBestFork(snap);
-        if (fork != null) {
-            long forkTip = fork.get(fork.size() - 1).height();
-            long need = snap.tipHeight() + reorgMinLead;
-            if (forkTip >= need) {
-                return takeover(fork, trigger);
+        List<List<Block>> eligible = eligibleForks(snap, reorgMinLead);
+        if (eligible.isEmpty()) {
+            List<Block> best = findBestFork(snap);
+            if (best != null) {
+                long forkTip = best.get(best.size() - 1).height();
+                long need = snap.tipHeight() + reorgMinLead;
+                pendingDetail += ("（竞争链已连通至 h=%d，未达到接管门槛 h>=%d，继续观察，"
+                        + "候选不丢弃）").formatted(forkTip, need);
             }
-            pendingDetail += ("（竞争链已连通至 h=%d，未达到接管门槛 h>=%d，继续观察，"
-                    + "候选不丢弃）").formatted(forkTip, need);
+            return reject(pendingReason, pendingDetail, trigger);
         }
-        return reject(pendingReason, pendingDetail, trigger);
+        String firstClash = null;
+        for (List<Block> fork : eligible) {
+            TakeoverAttempt attempt = attemptTakeover(fork);
+            if (attempt.succeeded()) {
+                return IngestResult.reorged(attempt.detail(),
+                        attempt.snapshot().tipHeight(),
+                        attempt.snapshot().tipHash(),
+                        attempt.snapshot().chainId());
+            }
+            if (firstClash == null) {
+                firstClash = attempt.detail();
+            }
+        }
+        // 达标候选的重放全部被拒：本次输入按非法拒绝，绝不发布半成品快照
+        return reject(RejectReason.INVALID_BLOCK,
+                "竞争链虽已达到换链门槛，但接管重放被整体拒绝，未发生换链、索引不变："
+                        + firstClash, trigger);
     }
 
     /**
-     * 在区块池中寻找"挂在当前规范链上"的最长竞争链。
-     * 返回分叉自身区块列表（共同祖先之后、按高度升序）；没有可连通的竞争链返回 null。
-     * 只考察高度高于规范链尖的候选块：等长/更短的分叉永不可能满足接管门槛。
+     * 所有"挂在当前规范链上"、且链尖领先达到 {@code minLead} 块的竞争链，
+     * 按链尖高度降序（哈希升序兜底，保证确定性）排列。
+     */
+    private List<List<Block>> eligibleForks(ChainSnapshot snap, int minLead) {
+        long need = snap.tipHeight() + minLead;
+        List<Block> candidates = store.findAllAbove(snap.tipHeight());
+        candidates.sort(Comparator.comparingLong(Block::height).reversed()
+                .thenComparing(Block::hash));
+        List<List<Block>> out = new ArrayList<>();
+        for (Block tip : candidates) {
+            List<Block> fork = traceToCanonical(tip, snap);
+            if (fork != null && tip.height() >= need) {
+                out.add(fork);
+            }
+        }
+        return out;
+    }
+
+    /**
+     * 在区块池中寻找"挂在当前规范链上"的最长竞争链（不考虑门槛是否满足），
+     * 仅用于在"继续观察"的拒绝说明里给出竞争链已连通到的高度。
      */
     private List<Block> findBestFork(ChainSnapshot snap) {
         List<Block> candidates = store.findAllAbove(snap.tipHeight());
-        // 确定性：高度降序、哈希升序；第一个能连通规范链的即最长竞争链
         candidates.sort(Comparator.comparingLong(Block::height).reversed()
                 .thenComparing(Block::hash));
         for (Block tip : candidates) {
@@ -274,20 +336,35 @@ public class IndexerService {
     }
 
     /**
-     * 换链接管：回滚到共同祖先，重放竞争链区块重建索引，整体发布新快照。
-     * 重放中任一交易哈希冲突则整体拒绝，本次提交不改变状态。
+     * 一次接管尝试的结果：要么成功并已发布完整新快照，要么失败（含可读原因），
+     * 失败时绝不修改当前快照，供调用方如实反馈。
      */
-    private IngestResult takeover(List<Block> fork, Block trigger) {
-        ChainSnapshot snap = current;
+    private record TakeoverAttempt(boolean succeeded, ChainSnapshot snapshot, String detail) {
+        static TakeoverAttempt ok(ChainSnapshot snap, String detail) {
+            return new TakeoverAttempt(true, snap, detail);
+        }
+
+        static TakeoverAttempt failed(String detail) {
+            return new TakeoverAttempt(false, null, detail);
+        }
+    }
+
+    /**
+     * 换链接管：回滚到共同祖先，重放竞争链区块重建索引，全部成功后整体发布新快照。
+     * 重放中任一交易哈希冲突则整体拒绝：不发布、不计数、索引保持完全不变。
+     */
+    private TakeoverAttempt attemptTakeover(List<Block> fork) {
+        ChainSnapshot before = current;
         long forkPoint = fork.get(0).height() - 1;
         ChainSnapshot rebuilt = rebuildUpTo(forkPoint);
         for (Block b : fork) {
             String clash = findTxClash(b, rebuilt);
             if (clash != null) {
-                return reject(RejectReason.INVALID_BLOCK, clash, trigger);
+                return TakeoverAttempt.failed(clash);
             }
             rebuilt = applyBlock(rebuilt, b);
         }
+        // 只有走到这里才整体发布：调用方任何时候都拿不到"重放了一半"的快照
         publish(rebuilt);
         metrics.recordReorg(forkPoint, fork.size());
         for (Block b : fork) {
@@ -295,13 +372,12 @@ public class IndexerService {
         }
         log.warn("REORG committed: forkPoint={} oldTipH={} newTipH={} newTipHash={} "
                         + "replayed={} minLead={}",
-                forkPoint, snap.tipHeight(), rebuilt.tipHeight(), rebuilt.tipHash(),
+                forkPoint, before.tipHeight(), rebuilt.tipHeight(), rebuilt.tipHash(),
                 fork.size(), reorgMinLead);
-        return IngestResult.reorged(
+        return TakeoverAttempt.ok(rebuilt,
                 ("竞争链达到换链门槛（领先 >= %d 块）：回滚至共同祖先高度 %d，"
                         + "重放 %d 个区块，新链尖 %s")
-                        .formatted(reorgMinLead, forkPoint, fork.size(), rebuilt.tipHash()),
-                rebuilt.tipHeight(), rebuilt.tipHash(), rebuilt.chainId());
+                        .formatted(reorgMinLead, forkPoint, fork.size(), rebuilt.tipHash()));
     }
 
     /** 按当前规范链区块重放到指定高度（-1 表示从空状态开始），得到回滚基线快照。 */
